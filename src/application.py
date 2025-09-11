@@ -35,7 +35,7 @@ if platform.system() == "Darwin":
         app = Application.get_instance()
         if not app:
             sys.exit(0)
-        
+
         # 使用app的主循环，更稳定且跨线程安全
         loop = app._main_loop
         if loop and not loop.is_closed():
@@ -49,7 +49,7 @@ if platform.system() == "Darwin":
                 except Exception as e:
                     print(f"创建shutdown任务失败: {e}")
                     sys.exit(0)
-            
+
             loop.call_soon_threadsafe(create_shutdown_task)
         else:
             # 主循环未就绪或已关闭，直接退出
@@ -138,6 +138,9 @@ class Application:
 
         # MCP服务器
         self.mcp_server = McpServer.get_instance()
+
+        # WSS订阅器
+        self.wss_subscriber = None
 
         # 消息处理器映射
         self._message_handlers = {
@@ -315,6 +318,9 @@ class Application:
         # 初始化快捷键管理器
         await self._initialize_shortcuts()
 
+        # 初始化WSS订阅器
+        await self._initialize_wss_subscriber()
+
         logger.info("应用程序组件初始化完成")
 
     async def _initialize_audio(self):
@@ -402,7 +408,7 @@ class Application:
         try:
             if not self.running or not self.protocol:
                 return
-            
+
             # 并发限制，避免任务风暴
             async def _send():
                 async with self._send_audio_semaphore:
@@ -419,7 +425,7 @@ class Application:
         try:
             if not self.running or not self.audio_codec:
                 return
-            
+
             # 音频数据处理需要实时性，限制并发，避免任务风暴
             async def _write():
                 async with self._audio_write_semaphore:
@@ -458,6 +464,7 @@ class Application:
 
         if mode == "gui":
             from src.display.gui_display import GuiDisplay
+
             self.display = GuiDisplay()
             self._setup_gui_callbacks()
         else:
@@ -489,12 +496,12 @@ class Application:
         try:
             if not self.running:
                 return
-            
+
             async def _execute():
                 await coro_func(*args)
-            
+
             task = asyncio.create_task(_execute())
-            
+
             def _on_done(t):
                 if not t.cancelled() and t.exception():
                     logger.error(f"GUI回调任务异常: {t.exception()}", exc_info=True)
@@ -848,11 +855,11 @@ class Application:
         try:
             if not self.running or not self.display:
                 return
-            
+
             # 创建后台任务更新显示，避免阻塞
             async def _update():
                 await update_func(*args)
-            
+
             self._create_background_task(_update(), "显示更新")
         except Exception as e:
             logger.error(f"调度显示更新失败: {e}", exc_info=True)
@@ -1349,12 +1356,16 @@ class Application:
             self._shutdown_event.set()
 
         try:
-            # 2. 关闭唤醒词检测器
+            # 2. 关闭WSS订阅器
+            if self.wss_subscriber:
+                await self.wss_subscriber.stop()
+
+            # 3. 关闭唤醒词检测器
             await self._safe_close_resource(
                 self.wake_word_detector, "唤醒词检测器", "stop"
             )
 
-            # 3. 取消所有长期任务
+            # 4. 取消所有长期任务
             if self._main_tasks:
                 logger.info(f"取消 {len(self._main_tasks)} 个主要任务")
                 tasks = list(self._main_tasks)
@@ -1372,7 +1383,7 @@ class Application:
 
                 self._main_tasks.clear()
 
-            # 4. 取消后台任务（短期任务池）
+            # 5. 取消后台任务（短期任务池）
             try:
                 if self._bg_tasks:
                     for t in list(self._bg_tasks):
@@ -1383,7 +1394,7 @@ class Application:
             except Exception as e:
                 logger.warning(f"取消后台任务时出错: {e}")
 
-            # 5. 关闭协议连接（尽早关闭，避免事件循环结束后仍有网络等待）
+            # 6. 关闭协议连接（尽早关闭，避免事件循环结束后仍有网络等待）
             if self.protocol:
                 try:
                     await self.protocol.close_audio_channel()
@@ -1391,7 +1402,7 @@ class Application:
                 except Exception as e:
                     logger.error(f"关闭协议连接失败: {e}")
 
-            # 6. 关闭音频设备（先停流后彻底关闭，缓解C扩展退出竞态）
+            # 7. 关闭音频设备（先停流后彻底关闭，缓解C扩展退出竞态）
             if self.audio_codec:
                 try:
                     await self.audio_codec.stop_streams()
@@ -1400,10 +1411,10 @@ class Application:
             # 尽早释放音频资源，避免事件循环关闭后再 awaiting 内部 sleep
             await self._safe_close_resource(self.audio_codec, "音频设备")
 
-            # 7. 关闭MCP服务器
+            # 8. 关闭MCP服务器
             await self._safe_close_resource(self.mcp_server, "MCP服务器")
 
-            # 8. 清理队列
+            # 9. 清理队列
             try:
                 for q in [
                     self.command_queue,
@@ -1417,7 +1428,7 @@ class Application:
             except Exception as e:
                 logger.error(f"清空队列失败: {e}")
 
-            # 9. 取消尾静默定时器并置静默事件，避免等待
+            # 10. 取消尾静默定时器并置静默事件，避免等待
             try:
                 if self._incoming_audio_idle_handle:
                     self._incoming_audio_idle_handle.cancel()
@@ -1427,7 +1438,7 @@ class Application:
             except Exception:
                 pass
 
-            # 10. 最后停止UI显示
+            # 11. 最后停止UI显示
             await self._safe_close_resource(self.display, "显示界面")
 
             logger.info("应用程序关闭完成")
@@ -1453,11 +1464,9 @@ class Application:
             if not self.protocol or not self._main_loop:
                 logger.warning("协议未初始化或事件循环不可用，丢弃MCP消息")
                 return
-            
+
             # 使用call_soon_threadsafe安全地调度到主事件循环
-            self._main_loop.call_soon_threadsafe(
-                self._schedule_mcp_send, msg
-            )
+            self._main_loop.call_soon_threadsafe(self._schedule_mcp_send, msg)
             # 确保异步回调快速返回
             await asyncio.sleep(0)
         except Exception as e:
@@ -1470,11 +1479,11 @@ class Application:
         try:
             if not self.running or not self.protocol:
                 return
-            
+
             # 创建后台任务发送MCP消息，避免阻塞
             async def _send():
                 await self.protocol.send_mcp_message(msg)
-            
+
             self._create_background_task(_send(), "发送MCP消息")
         except Exception as e:
             logger.error(f"调度MCP消息发送失败: {e}", exc_info=True)
@@ -1538,3 +1547,35 @@ class Application:
                 logger.warning("快捷键管理器初始化失败")
         except Exception as e:
             logger.error(f"初始化快捷键管理器失败: {e}", exc_info=True)
+
+    async def _initialize_wss_subscriber(self):
+        """
+        初始化WSS订阅器.
+        """
+        try:
+            # 从配置读取WSS设置
+            wss_url = self.config.get_config("WSS.URL", "")
+            send_interval = self.config.get_config("WSS.SEND_INTERVAL", 10)
+            batch_size = self.config.get_config("WSS.BATCH_SIZE", 3)
+
+            if not wss_url:
+                logger.info("未配置WSS URL，跳过WSS订阅器初始化")
+                return
+
+            logger.info(
+                f"初始化WSS订阅器，发送间隔: {send_interval}秒，批量大小: {batch_size}"
+            )
+            from src.tasks.wss_subscriber import WssSubscriber
+
+            self.wss_subscriber = WssSubscriber(
+                url=wss_url, send_interval=send_interval, batch_size=batch_size
+            )
+            self.wss_subscriber.set_application(self)
+
+            # 启动WSS订阅器
+            await self.wss_subscriber.start()
+
+            logger.info("WSS订阅器初始化成功")
+
+        except Exception as e:
+            logger.error(f"初始化WSS订阅器失败: {e}", exc_info=True)
